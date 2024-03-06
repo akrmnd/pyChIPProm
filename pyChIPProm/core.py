@@ -1,15 +1,37 @@
+from pathlib import Path
+from typing import Optional
 import pyBigWig
+from Bio import Entrez
 import pandas as pd
+from tqdm import tqdm
 
 
 class PyChIPProm:
-    def __init__(self, bw_path: str):
+    def __init__(self, email: str, api_key: str, bw_path: Optional[str], window: int = 150):
         self.bw_path = bw_path
-        self.bw = self._open_bw(bw_path)
+        self.bw = self.load_bw(bw_path)
+        self.window = window
+        self.EnterzGS = EntrezGeneSearch(email, api_key)
+        self.results = {}
 
-    def _open_bw(self, path: str):
+    def load_bw(self, path: Optional[str]):
+        if path is None:
+            raise ValueError("BigWig file path must not be None")
+        bw_path = Path(path)
+
+        # ファイルの存在とファイルタイプをチェック
+        if not bw_path.exists():
+            raise FileNotFoundError(f"The specified BigWig file was not found: {path}")
+        if not bw_path.is_file():
+            raise ValueError(f"The specified path is not a file: {path}")
+
         # pyBigWigライブラリを使用してBigWigファイルを開く
-        return pyBigWig.open(path)
+        try:
+            bw_file = pyBigWig.open(str(bw_path))
+        except Exception as e:
+            raise IOError(f"Failed to open BigWig file {path}: {e}")
+
+        return bw_file
 
     def filter_peaks(self, chrom: str, start: int, end: int, threshold: float):
         """
@@ -51,11 +73,6 @@ class PyChIPProm:
         max_peaks = grouped_df.groupby("group").apply(lambda x: x.loc[x["value"].idxmax()])
         return [(int(row.start), int(row.end), float(row.value)) for index, row in max_peaks.iterrows()]
 
-    def query_ncbi_for_gene_id(self, gene_name):
-        # Entrezを使用してNCBIからgene_idを取得
-        # 省略: Entrezへのクエリと結果の処理
-        pass
-
     def get_transcript_regulator(self, chrom: str, start: int, end: int):
         pass
 
@@ -64,12 +81,63 @@ class PyChIPProm:
         df = pd.DataFrame(results)
         df.to_csv(output_path, index=False)
 
-    def analyze(self, chrom, start, end, threshold, output_path):
-        # 解析の全プロセスを実行
+    def analyze(self, chrom: str, start: int, end: int, threshold: float):
         peaks = self.filter_peaks(chrom, start, end, threshold)
-        results = []
-        for peak in peaks:
-            gene_id = self.query_ncbi_for_gene_id(peak["gene_name"])
-            peak["gene_id"] = gene_id
-            results.append(peak)
-        self.output_results_to_csv(results, output_path)
+        res = []
+        for peak_start, peak_end, peak_value in tqdm(peaks):
+            gene_ids = self.EnterzGS.gene_search(
+                "".join(filter(str.isdigit, chrom)), peak_start - self.window, peak_end + self.window
+            )
+            for gene_id in gene_ids:
+                gene_detail = self.EnterzGS.fetch_gene_detail(gene_id, peak_start - self.window, peak_end + self.window)
+                result = {
+                    "peak_start": peak_start,
+                    "peak_end": peak_end,
+                    "peak_value": peak_value,
+                    "gene_id": gene_id,
+                    "gene_name": gene_detail.get("name"),
+                    "tss": gene_detail.get("tss"),
+                }
+                res.append(result)
+        self.results["chrom"] = res
+
+        return res
+
+
+class EntrezGeneSearch:
+    def __init__(self, email: str, api_key: str):
+        Entrez.email = email
+        Entrez.api_key = api_key
+
+    def gene_search(self, chrm: str, start: int, end: int, organism: str = "Homo sapiens"):
+        search_term = f"({start}[Base Position]:{end}[Base Position]) AND {chrm}[Chromosome] AND {organism}[Organism]"
+        with Entrez.esearch(db="gene", term=search_term) as handle:
+            record = Entrez.read(handle)
+        return record.get("IdList", [])
+
+    def fetch_gene_detail(self, gene_id: str, peak_start: int, peak_end: int):
+        try:
+            with Entrez.efetch(db="gene", id=gene_id, retmode="xml") as handle:
+                gene_record = Entrez.read(handle)
+        except Exception as e:
+            print(f"Error fetching gene detail for gene ID {gene_id}: {e}")
+            return {}
+
+        try:
+            gene_name = gene_record[0].get("Entrezgene_gene", {}).get("Gene-ref", {}).get("Gene-ref_locus")
+            tss = (
+                gene_record[0]
+                .get("Entrezgene_locus", [{}])[0]
+                .get("Gene-commentary_seqs", [{}])[0]
+                .get("Seq-loc_int", {})
+                .get("Seq-interval", {})
+                .get("Seq-interval_from")
+            )
+            if gene_name and tss and peak_start <= int(tss) <= peak_end:
+                return {"name": gene_name, "tss": tss}
+            else:
+                print(f"TSS for gene ID {gene_id} is out of the specified peak range or not found.")
+                return {}
+        except (IndexError, KeyError) as e:
+            print(f"Error parsing gene detail for gene ID {gene_id}: {e}")
+            return {}
