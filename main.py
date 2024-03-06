@@ -18,4 +18,10 @@ def main(bw_path: str, output_path: str, threshold: float):
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Script to analyze BigWig files with pyChIPProm.")
+    parser.add_argument("-i", "--bw_path", type=str, help="Path to the BigWig file")
+    parser.add_argument("-o", "--output_path", type=str, help="Path to the output file where results will be saved")
+    parser.add_argument("-t", "--threshold", type=float, help="Threshold value for filtering peaks")
+
+    args = parser.parse_args()
+    main(args.bw_path, args.output_path, args.threshold)
