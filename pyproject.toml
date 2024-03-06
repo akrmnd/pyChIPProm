@@ -12,6 +12,9 @@ pybigwig = "^0.3.22"
 biopython = "^1.83"
 
 
+[tool.poetry.group.dev.dependencies]
+tqdm = "^4.66.2"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
