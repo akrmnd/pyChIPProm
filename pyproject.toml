@@ -1,8 +1,8 @@
 [tool.poetry]
-name = "ehnprosearch"
+name = "pyChIPProm"
 version = "0.1.0"
 description = ""
-authors = ["akira-manda <akiramanda@gmail.com>"]
+authors = ["akrmnd <akiramanda@gmail.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
