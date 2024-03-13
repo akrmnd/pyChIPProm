@@ -1,18 +1,16 @@
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 import pyBigWig
-from Bio import Entrez
 import pandas as pd
 from tqdm import tqdm
 
 
 class PyChIPProm:
-    def __init__(self, email: str, api_key: str, bw_path: Optional[str], window: int = 150):
-        self.bw_path = bw_path
+    def __init__(self, bw_path: str, gff_path: str, window: int = 150):
         self.bw = self.load_bw(bw_path)
+        self.df = self.load_gff(gff_path)
         self.window = window
-        self.EnterzGS = EntrezGeneSearch(email, api_key)
-        self.results = {}
 
     def load_bw(self, path: Optional[str]):
         if path is None:
@@ -32,6 +30,20 @@ class PyChIPProm:
             raise IOError(f"Failed to open BigWig file {path}: {e}")
 
         return bw_file
+
+    def load_gff(self, path: Optional[str]) -> pd.DataFrame:
+        """GFF3ファイルを読み込み、pandas DataFrameに変換する"""
+        if path is None:
+            raise ValueError("GFF file path must not be None")
+        col_names = ["seqid", "source", "type", "start", "end", "score", "strand", "phase", "attributes"]
+        df = pd.read_csv(path, sep="\t", comment="#", names=col_names)
+        # 属性フィールドをパースして新しい列を作成する（例：ID, Nameなど）
+        df["gene_id"] = df["attributes"].str.extract(r"ID=([^;]+)")
+        df["gene_name"] = df["attributes"].str.extract(r"gene_name=([^;]+)")
+        df["gene_type"] = df["attributes"].str.extract(r"gene_type=([^;]+)")
+        # 不要な列を削除
+        df.drop("attributes", axis=1, inplace=True)
+        return df[(df["gene_type"] == "protein_coding") & (df["type"] == "gene")]
 
     def filter_peaks(self, chrom: str, start: int, end: int, threshold: float):
         """
@@ -76,68 +88,64 @@ class PyChIPProm:
     def get_transcript_regulator(self, chrom: str, start: int, end: int):
         pass
 
-    def output_results_to_csv(self, results, output_path):
-        # pandasを使用して結果をcsvファイルに出力
+    def output(self, results: list[dict[str, Any]], output_path: str, output_type: str = "csv"):
         df = pd.DataFrame(results)
-        df.to_csv(output_path, index=False)
+        if output_type == "csv":
+            # pandasを使用して結果をcsvファイルに出力
+            df.to_csv(output_path, index=False)
+        elif output_type == "json":
+            with open(output_path, "w") as file:
+                json.dump({"result": results}, file)
+        else:
+            raise ValueError("Output type error. must be 'csv' or 'json'.")
 
     def analyze(self, chrom: str, start: int, end: int, threshold: float):
         peaks = self.filter_peaks(chrom, start, end, threshold)
         res = []
+        genes_chrom = self.df[(self.df["seqid"] == chrom)]
         for peak_start, peak_end, peak_value in tqdm(peaks):
-            gene_ids = self.EnterzGS.gene_search(
-                "".join(filter(str.isdigit, chrom)), peak_start - self.window, peak_end + self.window
-            )
-            for gene_id in gene_ids:
-                gene_detail = self.EnterzGS.fetch_gene_detail(gene_id, peak_start - self.window, peak_end + self.window)
-                result = {
-                    "peak_start": peak_start,
-                    "peak_end": peak_end,
-                    "peak_value": peak_value,
-                    "gene_id": gene_id,
-                    "gene_name": gene_detail.get("name"),
-                    "tss": gene_detail.get("tss"),
-                }
-                res.append(result)
-        self.results["chrom"] = res
+            genes_target = genes_chrom[
+                ~((genes_chrom["end"] < (peak_start - self.window)) | (genes_chrom["start"] > (peak_end + self.window)))
+            ]
+
+            if len(genes_target) == 0:
+                res.append(
+                    {
+                        "peak_start": peak_start,
+                        "peak_end": peak_end,
+                        "peak_value": peak_value,
+                        "gene_id": None,
+                        "gene_name": None,
+                        "gene_start": None,
+                        "tss": False,
+                    }
+                )
+                continue
+
+            for _, gene_t in genes_target.iterrows():
+                if (gene_t["start"] >= peak_start - self.window) and (gene_t["start"] <= peak_end + self.window):
+                    res.append(
+                        {
+                            "peak_start": peak_start,
+                            "peak_end": peak_end,
+                            "peak_value": peak_value,
+                            "gene_id": gene_t.get("gene_id"),
+                            "gene_name": gene_t.get("gene_name"),
+                            "gene_start": gene_t.get("start"),
+                            "tss": True,
+                        }
+                    )
+                else:
+                    res.append(
+                        {
+                            "peak_start": peak_start,
+                            "peak_end": peak_end,
+                            "peak_value": peak_value,
+                            "gene_id": gene_t.get("gene_id"),
+                            "gene_name": gene_t.get("gene_name"),
+                            "gene_start": gene_t.get("start"),
+                            "tss": False,
+                        }
+                    )
 
         return res
-
-
-class EntrezGeneSearch:
-    def __init__(self, email: str, api_key: str):
-        Entrez.email = email
-        Entrez.api_key = api_key
-
-    def gene_search(self, chrm: str, start: int, end: int, organism: str = "Homo sapiens"):
-        search_term = f"({start}[Base Position]:{end}[Base Position]) AND {chrm}[Chromosome] AND {organism}[Organism]"
-        with Entrez.esearch(db="gene", term=search_term) as handle:
-            record = Entrez.read(handle)
-        return record.get("IdList", [])
-
-    def fetch_gene_detail(self, gene_id: str, peak_start: int, peak_end: int):
-        try:
-            with Entrez.efetch(db="gene", id=gene_id, retmode="xml") as handle:
-                gene_record = Entrez.read(handle)
-        except Exception as e:
-            print(f"Error fetching gene detail for gene ID {gene_id}: {e}")
-            return {}
-
-        try:
-            gene_name = gene_record[0].get("Entrezgene_gene", {}).get("Gene-ref", {}).get("Gene-ref_locus")
-            tss = (
-                gene_record[0]
-                .get("Entrezgene_locus", [{}])[0]
-                .get("Gene-commentary_seqs", [{}])[0]
-                .get("Seq-loc_int", {})
-                .get("Seq-interval", {})
-                .get("Seq-interval_from")
-            )
-            if gene_name and tss and peak_start <= int(tss) <= peak_end:
-                return {"name": gene_name, "tss": tss}
-            else:
-                print(f"TSS for gene ID {gene_id} is out of the specified peak range or not found.")
-                return {}
-        except (IndexError, KeyError) as e:
-            print(f"Error parsing gene detail for gene ID {gene_id}: {e}")
-            return {}
